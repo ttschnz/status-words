@@ -2,6 +2,8 @@
 
 [简体中文](https://github.com/zimabx/status-words/blob/main/README.zh-CN.md)
 
+[supportURL](https://github.com/zimabx/status-words/issues)
+
 Show customizable word and character statistics in the Obsidian status bar.
 
 StatusWords displays live statistics for the current note, current line,
