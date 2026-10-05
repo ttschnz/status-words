@@ -116,6 +116,7 @@ const TEMPLATE_PROPERTY_DEFINITIONS = [
     key: "currentParagraphCount",
     labels: { en: "Current paragraph count", zh: "当前段落字数" },
   },
+  { key: "sectionWords", labels: { en: "Section count", zh: "本节字数" } },
   { key: "noteCount", labels: { en: "Note count", zh: "全文字数" } },
 
   { key: "selectionCount", labels: { en: "Selection count", zh: "选中文本字数" } },
@@ -420,10 +421,12 @@ module.exports = class CurrentLineAndNoteCountPlugin extends Plugin {
     const currentLineRawCount = this.countCharacters(currentLineText);
     const currentParagraphRawCount = this.countCharacters(currentParagraphText);
     const selectionRawCount = this.countCharacters(selectionText);
+    const sectionRawCount = this.noteLevelCache.sectionWordCounts[cursor.line] ?? 0;
 
     return {
       currentLineCount: this.formatCount(currentLineRawCount),
       currentParagraphCount: this.formatCount(currentParagraphRawCount),
+      sectionWords: this.formatCount(sectionRawCount),
       noteCount: this.formatCount(this.noteLevelCache.noteRawCount),
       selectionCount: this.formatCount(selectionRawCount),
 
@@ -454,10 +457,67 @@ module.exports = class CurrentLineAndNoteCountPlugin extends Plugin {
     }
 
     const noteText = editor.getValue() ?? "";
+    const noteLines = noteText.split(/\r?\n/);
+    const sectionWordCounts = new Array(noteLines.length).fill(0);
+    const newlineCount = this.countCharacters("\n");
+    let sectionStartLine = -1;
+    let sectionRawCount = 0;
+    let codeFence = null;
+    let inFrontmatter = noteLines[0] === "---";
+
+    for (let lineNumber = 0; lineNumber < noteLines.length; lineNumber++) {
+      const line = noteLines[lineNumber];
+
+      if (inFrontmatter) {
+        if (lineNumber > 0 && /^(?:---|\.\.\.)\s*$/.test(line)) {
+          inFrontmatter = false;
+        }
+        continue;
+      }
+
+      const fence = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+      if (codeFence) {
+        if (
+          fence &&
+          fence[1][0] === codeFence.character &&
+          fence[1].length >= codeFence.length &&
+          fence[2].trim() === ""
+        ) {
+          codeFence = null;
+        }
+        if (sectionStartLine >= 0) {
+          sectionRawCount += newlineCount + this.countCharacters(line);
+        }
+        continue;
+      }
+
+      if (fence) {
+        codeFence = { character: fence[1][0], length: fence[1].length };
+        if (sectionStartLine >= 0) {
+          sectionRawCount += newlineCount + this.countCharacters(line);
+        }
+        continue;
+      }
+
+      if (/^ {0,3}#{1,6}(?:\s|$)/.test(line)) {
+        if (sectionStartLine >= 0) {
+          sectionWordCounts.fill(sectionRawCount, sectionStartLine, lineNumber);
+        }
+        sectionStartLine = lineNumber;
+        sectionRawCount = this.countCharacters(line);
+      } else if (sectionStartLine >= 0) {
+        sectionRawCount += newlineCount + this.countCharacters(line);
+      }
+    }
+
+    if (sectionStartLine >= 0) {
+      sectionWordCounts.fill(sectionRawCount, sectionStartLine);
+    }
 
     this.noteLevelCache = {
       noteRawCount: this.countCharacters(noteText),
       noteLineCount: editor.lineCount(),
+      sectionWordCounts,
       fileName: file?.basename ?? "",
       fileNameWithExtension: file?.name ?? "",
       filePath: file?.path ?? "",
@@ -468,6 +528,7 @@ module.exports = class CurrentLineAndNoteCountPlugin extends Plugin {
     return {
       currentLineCount: this.formatCount(26),
       currentParagraphCount: this.formatCount(128),
+      sectionWords: this.formatCount(248),
       noteCount: this.formatCount(1284),
       selectionCount: this.formatCount(56),
 
@@ -890,6 +951,8 @@ class CurrentLineAndNoteCountSettingTab extends PluginSettingTab {
     dropdown.onChange(async (value) => {
       this.plugin.settings.countingMode = value;
       await this.plugin.saveSettings();
+      this.plugin.resetCache();
+      this.plugin.updateStatusBar(true);
 
       updateModeDesc();
       this.updatePreview();

@@ -1,7 +1,7 @@
 {
   "id": "status-words",
   "name": "StatusWords",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "minAppVersion": "1.12.7",
   "description": "Show customizable word and character statistics in the status bar.",
   "author": "zimabx",

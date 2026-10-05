@@ -11,7 +11,7 @@ current paragraph, selected text, cursor position, and file information.
 
 ## Features
 
-- Show character counts for the current line, current paragraph, full note, and selected text.
+- Show character counts for the current line, current paragraph, heading section, full note, and selected text.
 - Display selection line count, cursor position, file name, and file path.
 - Customize the status bar text with templates.
 - Choose from multiple counting modes.
@@ -58,6 +58,7 @@ Note {{Note count}} | {{Total lines}} lines
 
 - `currentLineCount`
 - `currentParagraphCount`
+- `sectionWords`
 - `noteCount`
 - `selectionCount`
 - `selectionLineCount`
