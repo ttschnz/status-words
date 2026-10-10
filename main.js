@@ -1,5 +1,7 @@
 const {
   Plugin,
+  Component,
+  MarkdownRenderer,   
   MarkdownView,
   PluginSettingTab,
   ButtonComponent,
@@ -106,6 +108,14 @@ const COUNTING_MODE_DEFINITIONS = [
     descriptions: {
       en: "Counts user-visible characters; emoji sequences usually count as 1.",
       zh: "按肉眼看到的字符统计，emoji 等组合字符通常算 1 个。",
+    },
+  },
+  {
+    key: "rendered",
+    labels: { en: "Rendered text", zh: "渲染后文本" },
+    descriptions: {
+      en: "Counts only visible characters of the rendered Markdown, without whitespace. In source mode, raw text without whitespace.",
+      zh: "只统计渲染后可见的字符，不含空白。源码模式下统计去除空白的原始文本。",
     },
   },
 ];
@@ -219,8 +229,13 @@ module.exports = class CurrentLineAndNoteCountPlugin extends Plugin {
 
     this.lastCacheKey = "";
     this.noteLevelCache = null;
+    this.renderedCountCache = new Map();
+    this.renderedCharBudget = 0;
+    this.pendingRenders = new Set();
+    this.renderRefreshTimer = null;
 
-    this.addSettingTab(new CurrentLineAndNoteCountSettingTab(this.app, this));
+    this.settingTab = new CurrentLineAndNoteCountSettingTab(this.app, this);
+    this.addSettingTab(this.settingTab);
 
     this.updateStatusBar(true);
 
@@ -269,6 +284,7 @@ module.exports = class CurrentLineAndNoteCountPlugin extends Plugin {
   onunload() {
     if (this.statusBar) {
       this.statusBar.remove();
+      window.clearTimeout(this.renderRefreshTimer);
     }
   }
 
@@ -451,17 +467,18 @@ module.exports = class CurrentLineAndNoteCountPlugin extends Plugin {
     };
   }
 
-  refreshNoteLevelCache(editor, file) {
-    if (this.noteLevelCache) {
+    refreshNoteLevelCache(editor, file) {
+    const sourceMode = this.isSourceMode();
+
+    if (this.noteLevelCache && this.noteLevelCache.sourceMode === sourceMode) {
       return;
     }
 
     const noteText = editor.getValue() ?? "";
     const noteLines = noteText.split(/\r?\n/);
     const sectionWordCounts = new Array(noteLines.length).fill(0);
-    const newlineCount = this.countCharacters("\n");
     let sectionStartLine = -1;
-    let sectionRawCount = 0;
+    let sectionText = "";
     let codeFence = null;
     let inFrontmatter = noteLines[0] === "---";
 
@@ -486,7 +503,7 @@ module.exports = class CurrentLineAndNoteCountPlugin extends Plugin {
           codeFence = null;
         }
         if (sectionStartLine >= 0) {
-          sectionRawCount += newlineCount + this.countCharacters(line);
+          sectionText += "\n" + line;
         }
         continue;
       }
@@ -494,30 +511,35 @@ module.exports = class CurrentLineAndNoteCountPlugin extends Plugin {
       if (fence) {
         codeFence = { character: fence[1][0], length: fence[1].length };
         if (sectionStartLine >= 0) {
-          sectionRawCount += newlineCount + this.countCharacters(line);
+          sectionText += "\n" + line;
         }
         continue;
       }
 
       if (/^ {0,3}#{1,6}(?:\s|$)/.test(line)) {
         if (sectionStartLine >= 0) {
-          sectionWordCounts.fill(sectionRawCount, sectionStartLine, lineNumber);
+          sectionWordCounts.fill(
+            this.countCharacters(sectionText),
+            sectionStartLine,
+            lineNumber
+          );
         }
         sectionStartLine = lineNumber;
-        sectionRawCount = this.countCharacters(line);
+        sectionText = line;
       } else if (sectionStartLine >= 0) {
-        sectionRawCount += newlineCount + this.countCharacters(line);
+        sectionText += "\n" + line;
       }
     }
 
     if (sectionStartLine >= 0) {
-      sectionWordCounts.fill(sectionRawCount, sectionStartLine);
+      sectionWordCounts.fill(this.countCharacters(sectionText), sectionStartLine);
     }
 
     this.noteLevelCache = {
       noteRawCount: this.countCharacters(noteText),
       noteLineCount: editor.lineCount(),
       sectionWordCounts,
+      sourceMode,
       fileName: file?.basename ?? "",
       fileNameWithExtension: file?.name ?? "",
       filePath: file?.path ?? "",
@@ -649,6 +671,10 @@ module.exports = class CurrentLineAndNoteCountPlugin extends Plugin {
       return this.countGraphemes(value);
     }
 
+    if (mode === "rendered") {
+      return this.countRenderedCharacters(value);
+    }
+
     return value.length;
   }
 
@@ -676,12 +702,136 @@ module.exports = class CurrentLineAndNoteCountPlugin extends Plugin {
     return Array.from(text).length;
   }
 
+  countVisible(text) {
+    return this.countGraphemes(String(text ?? "").replace(/\s/g, ""));
+  }
+
   formatCount(num) {
     if (!this.settings.useThousandsSeparator) {
       return String(num);
     }
 
     return NUMBER_FORMATTER.format(num);
+  }
+
+  isSourceMode() {
+    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+    return (
+      !!view && view.getMode() === "source" && view.getState().source === true
+    );
+  }
+
+  splitMathAndEmbeds(text) {
+    let mathCount = 0;
+
+    const stripped = text.replace(
+      /(`{3,}|~{3,})[\s\S]*?(?:\1|$)|`[^`\n]*`|\\\$|!\[\[[^\]\n]*\]\]|!\[[^\]\n]*\]\([^)\n]*\)|\$\$([\s\S]+?)\$\$|\$(?!\s)([^$\n]+?)(?<!\s)\$(?!\d)/g,
+      (match, fence, block, inline) => {
+        if (match.startsWith("![")) {
+          return ""; // embed: ignored
+        }
+
+        const tex = block ?? inline;
+
+        if (tex === undefined) {
+          return match; // code or escaped dollar: leave untouched
+        }
+
+        
+        mathCount += this.countVisible(tex);
+        return "";
+      }
+    );
+
+    return { stripped, mathCount };
+  }
+
+  countRenderedCharacters(text) {
+    if (!text.trim()) {
+      return 0;
+    }
+
+    if (this.isSourceMode()) {
+      return this.countVisible(text);
+    }
+
+    const { stripped, mathCount } = this.splitMathAndEmbeds(text);
+
+    if (!stripped.trim()) {
+      return mathCount;
+    }
+
+    const cached = this.renderedCountCache.get(stripped);
+
+    if (cached !== undefined) {
+      return cached + mathCount;
+    }
+
+    this.scheduleRender(stripped);
+    return this.approximateVisibleCount(stripped) + mathCount;
+  }
+
+  approximateVisibleCount(text) {
+    return this.countVisible(
+      text
+      .replace(/^ {0,3}(#{1,6}|>+|[-*+]|\d+[.)])\s+/gm, "")
+      .replace(/!?\[\[([^\]|]*\|)?([^\]]*)\]\]/g, "$2")
+      .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
+      .replace(/[*_~=`]/g, "")
+    );
+  }
+
+  storeRenderedCount(text, count) {
+    this.renderedCountCache.set(text, count);
+    this.renderedCharBudget += text.length;
+
+    // evict oldest entries so typing in big notes doesn't pile up memory
+    for (const key of this.renderedCountCache.keys()) {
+      if (this.renderedCharBudget <= 2000000) {
+        break;
+      }
+      this.renderedCountCache.delete(key);
+      this.renderedCharBudget -= key.length;
+    }
+  }
+
+  scheduleRender(text) {
+    if (this.pendingRenders.has(text)) {
+      return;
+    }
+
+    this.pendingRenders.add(text);
+
+    const sourcePath = this.app.workspace.getActiveFile()?.path ?? "";
+    const container = document.createElement("div");
+    const component = new Component();
+    component.load();
+
+    MarkdownRenderer.render(this.app, text, container, sourcePath, component)
+      .then(() => {
+        this.storeRenderedCount(
+          text,
+          this.countVisible(container.textContent)
+        );
+      })
+      .catch(() => {
+        this.storeRenderedCount(text, this.approximateVisibleCount(text));
+      })
+      .finally(() => {
+        component.unload();
+        this.pendingRenders.delete(text);
+        this.queueRefreshAfterRender();
+      });
+  }
+
+  queueRefreshAfterRender() {
+    window.clearTimeout(this.renderRefreshTimer);
+
+    this.renderRefreshTimer = window.setTimeout(() => {
+      this.noteLevelCache = null; // was built with approximations
+      this.updateStatusBar(true);
+      this.settingTab?.refreshPreviews();
+    }, 50);
   }
 };
 
@@ -1148,6 +1298,12 @@ class CurrentLineAndNoteCountSettingTab extends PluginSettingTab {
     const output = this.plugin.renderTemplate(template, data);
 
     this.previewValueEl.setText(output || this.plugin.t("emptyPreview"));
+  }
+
+  refreshPreviews() {
+    this.updatePreview();
+    this.updateCountingModePreview();
+    this.updateExamplePreviews();
   }
 
   updateExamplePreviews() {
